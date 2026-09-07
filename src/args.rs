@@ -29,6 +29,9 @@ pub struct Args {
     /// Enable combined mode: process existing images then monitor for new ones
     #[arg(short, long)]
     pub combined: bool,
+    /// Skip assets with any saved description (AI or human). Takes precedence over overwrite settings.
+    #[arg(long, env = "IMMICH_ANALYZE_SKIP_PROCESSED")]
+    pub skip_processed: bool,
     /// Overwrite existing entries in database (process all files regardless of existing descriptions) (same as --overwrite-policy all)
     #[arg(short, long)]
     pub overwrite_existing: bool,
@@ -171,10 +174,32 @@ pub struct Args {
 impl Args {
     #[must_use]
     pub fn effective_overwrite_policy(&self) -> OverwritePolicy {
+        if self.skip_processed {
+            return OverwritePolicy::None;
+        }
         match self.overwrite_policy {
             Some(policy) => policy,
             None if self.overwrite_existing => OverwritePolicy::All,
             None => OverwritePolicy::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_processed_takes_precedence_over_overwrite_settings() {
+        for options in [
+            vec!["--overwrite-existing"],
+            vec!["--overwrite-policy", "all"],
+            vec!["--overwrite-policy", "missing-ai"],
+        ] {
+            let mut command = vec!["immich-analyze", "--skip-processed"];
+            command.extend(options);
+            let args = Args::try_parse_from(command).expect("valid skip/overwrite options");
+            assert_eq!(args.effective_overwrite_policy(), OverwritePolicy::None);
         }
     }
 }

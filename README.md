@@ -22,7 +22,7 @@ The application supports two data access modes:
 - Internationalization support (English and Russian)
 - Docker container support
 - Prompt enrichment: optionally enrich AI prompts with asset metadata (EXIF, location, camera info, people with ages, tags, resolution, MIME type) - works **only** in Immich API mode
-- Selective description updates: use `--preserve-human` with any overwrite policy to preserve human-written text outside `[AI]...[/AI]` blocks; use `--overwrite-policy missing-ai` to process only assets without existing AI blocks
+- Selective description updates: use `--preserve-human` with any overwrite policy to preserve human-written text outside `[AI]...[/AI]` blocks; use `--skip-processed` to skip any saved description before overwrite rules; use `--overwrite-policy missing-ai` to process only assets without existing AI blocks
 - Structured logging via `env_logger` (configure with `RUST_LOG` environment variable)
 - Wait for Immich to become available on startup (API mode only, configurable timeout)
 
@@ -104,7 +104,7 @@ docker compose run --rm -e IMMICH_ANALYZE_MODE=batch immich-analyze
 docker compose up -d immich-analyze
 ```
 
-Existing descriptions are skipped by default (`IMMICH_ANALYZE_OVERWRITE_POLICY=none`), including older poster-frame descriptions. `missing-ai` processes assets without an `[AI]` block; `all` permits replacing existing AI blocks. This Compose setup preserves human text outside those blocks. Do not run a second batch alongside the active analyzer.
+Existing descriptions are skipped by default (`IMMICH_ANALYZE_OVERWRITE_POLICY=none`), including older poster-frame descriptions. `IMMICH_ANALYZE_SKIP_PROCESSED=true` is the stricter override when you want to skip any saved description, whether AI-wrapped, plain AI, or human-written; cleared descriptions remain eligible. It applies in database/API backends and monitor/combined/batch modes. `missing-ai` processes only assets without an `[AI]` block. This Compose setup preserves human text outside those blocks. Do not run a second batch alongside the active analyzer.
 
 Videos are read from originals, not thumbnails, and processed sequentially in 30-second segments with up to 32 uniformly sampled source frames per segment. The first audio track is analyzed for speech and non-speech content; a missing audio track is valid. Descriptions contain video-relative timestamp ranges. A corrupt/oversized file, failed segment, or truncated model response leaves the existing description unchanged rather than storing a partial result or falling back to a poster frame.
 
@@ -292,7 +292,8 @@ Without video hosts, existing preview-only behavior remains available. Standalon
 |----------|-------------|---------|
 | `IMMICH_ANALYZE_MODE` | Operating mode: `monitor`, `combined`, or `batch` | `combined` |
 | `IMMICH_ANALYZE_OVERWRITE_EXISTING` | If true, overwrite existing descriptions (alias for `--overwrite-policy all`) | `false` |
-| `IMMICH_ANALYZE_OVERWRITE_POLICY` | Overwrite policy: `none` (skip any with description), `all` (process everything), `missing-ai` (process only if no `[AI]...[/AI]` block). Overrides `IMMICH_ANALYZE_OVERWRITE_EXISTING` | `none` |
+| `IMMICH_ANALYZE_OVERWRITE_POLICY` | Overwrite policy: `none` (skip any with description), `all` (process everything), `missing-ai` (process only if no `[AI]...[/AI]` block). Overrides `IMMICH_ANALYZE_OVERWRITE_EXISTING` and is overridden by `IMMICH_ANALYZE_SKIP_PROCESSED` | `none` |
+| `IMMICH_ANALYZE_SKIP_PROCESSED` | If true, skip any asset with a nonempty saved description before overwrite policy is applied; cleared descriptions remain eligible. Overrides every overwrite setting | `false` |
 | `IMMICH_ANALYZE_PRESERVE_HUMAN` | If true, preserve human text outside `[AI]...[/AI]` blocks by only replacing the AI block. Incompatible with `--disable-ai-wrapper` | `false` |
 | `IMMICH_ANALYZE_LANG` | Interface language for the application (en, ru) | `en` |
 | `IMMICH_ANALYZE_MAX_CONCURRENT` | Max concurrent AI requests | `4` |
@@ -326,6 +327,8 @@ Options:
           Overwrite existing entries in database (process all files regardless of existing descriptions) (same as --overwrite-policy all)
   -O, --overwrite-policy <OVERWRITE_POLICY>
           Overwrite policy [default: none]: none (skip any with description), all (process everything), missing-ai (process only if no [AI]...[/AI] block). Takes precedence over --overwrite-existing [possible values: none, all, missing-ai]
+      --skip-processed
+          Skip any asset with a nonempty saved description before overwrite policy is applied; cleared descriptions remain eligible (takes precedence over all overwrite settings)
   -p, --preserve-human
           When overwriting or adding, preserve human-entered text by only replacing the [AI]...[/AI] block
       --immich-root <IMMICH_ROOT>
@@ -611,7 +614,7 @@ The application integrates with your Immich instance by analyzing preview images
 - Event cooldown (database mode) to prevent duplicate processing of rapid filesystem events
 - Prompt enrichment: optionally enrich AI prompts with asset metadata (EXIF metadata, location, camera info, recognized people with ages, tags, resolution, MIME type) via the Immich API for more detailed descriptions
 - Selective description preservation: when using `--preserve-human`, only the `[AI]...[/AI]` block in the description is replaced, preserving any human-written text outside this block. If no `[AI]...[/AI]` block exists, the AI-generated block is appended to the existing description
-- Overwrite policies: use `--overwrite-policy all` to process everything, `--overwrite-policy none` to skip existing (default), or `--overwrite-policy missing-ai` to skip only assets with an existing `[AI]...[/AI]` block (processes human-only and empty descriptions)
+- Processing controls: use `--skip-processed` (or `IMMICH_ANALYZE_SKIP_PROCESSED=true`) to skip any saved description before overwrite policy is considered; this is the safest override and cleared descriptions remain eligible. Use `--overwrite-policy missing-ai` when you only want to skip assets with an existing `[AI]...[/AI]` block (processes human-only and empty descriptions). Use `--overwrite-policy all` to process everything, or `none` for the default conservative skip-any-description behavior
 - Structured logging via `env_logger` for easier debugging and monitoring
 
 ## Troubleshooting
