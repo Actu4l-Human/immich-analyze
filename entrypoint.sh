@@ -84,6 +84,7 @@ elif [ -n "$IMMICH_ANALYZE_OLLAMA_HOSTS" ]; then
 fi
 
 # api_key are read from env by clap - no need to pass explicitly
+# IMMICH_ANALYZE_SKIP_PROCESSED is read directly from env by clap - no need to pass explicitly
 
 if [ -n "$IMMICH_ANALYZE_MODEL_NAME" ]; then
     args+=("--model-name" "$IMMICH_ANALYZE_MODEL_NAME")
