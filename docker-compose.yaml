@@ -1,0 +1,74 @@
+services:
+  qwen-omni:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.qwen-omni
+    image: immich-qwen-omni:local
+    init: true
+    restart: unless-stopped
+    shm_size: "8gb"
+    command:
+      - vllm
+      - serve
+      - ${QWEN_OMNI_MODEL:-Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound}
+      - --omni
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8091"
+      - --served-model-name
+      - qwen-omni
+      - --deploy-config
+      - /etc/qwen-omni/deploy.yaml
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - qwen-omni-cache:/root/.cache/huggingface
+      - ./deploy/qwen-omni.yaml:/etc/qwen-omni/deploy.yaml:ro
+    ports:
+      - "127.0.0.1:${QWEN_OMNI_PORT:-8091}:8091"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${QWEN_OMNI_GPU_ID:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=4).close()"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60m
+      retries: 12
+
+  immich-analyze:
+    build:
+      context: .
+    image: immich-analyze:local
+    init: true
+    restart: unless-stopped
+    depends_on:
+      qwen-omni:
+        condition: service_healthy
+    environment:
+      IMMICH_ANALYZE_DATA_ACCESS_MODE: immich-api
+      IMMICH_API_URL: ${IMMICH_API_URL:?Set the remote Immich origin in .env}
+      IMMICH_API_KEY: ${IMMICH_API_KEY:?Set the remote Immich API key in .env}
+      IMMICH_ANALYZE_MODE: ${IMMICH_ANALYZE_MODE:-combined}
+      IMMICH_ANALYZE_INTERFACE: llamacpp
+      IMMICH_ANALYZE_HOSTS: http://qwen-omni:8091
+      IMMICH_ANALYZE_MODEL_NAME: qwen-omni
+      IMMICH_ANALYZE_VIDEO_HOSTS: http://qwen-omni:8091
+      IMMICH_ANALYZE_VIDEO_MODEL_NAME: qwen-omni
+      IMMICH_ANALYZE_MAX_CONCURRENT: ${IMMICH_ANALYZE_MAX_CONCURRENT:-1}
+      IMMICH_ANALYZE_VIDEO_MAX_CONCURRENT: ${IMMICH_ANALYZE_VIDEO_MAX_CONCURRENT:-1}
+      IMMICH_ANALYZE_VIDEO_MAX_BYTES: ${IMMICH_ANALYZE_VIDEO_MAX_BYTES:-2147483648}
+      IMMICH_ANALYZE_TIMEOUT: ${IMMICH_ANALYZE_TIMEOUT:-600}
+      IMMICH_ANALYZE_MAX_RETRIES: ${IMMICH_ANALYZE_MAX_RETRIES:-3}
+      IMMICH_ANALYZE_OVERWRITE_POLICY: ${IMMICH_ANALYZE_OVERWRITE_POLICY:-none}
+      IMMICH_ANALYZE_PRESERVE_HUMAN: "true"
+      IMMICH_ANALYZE_API_POLL_INTERVAL: ${IMMICH_ANALYZE_API_POLL_INTERVAL:-10}
+      IMMICH_ANALYZE_HEALTH_PORT: "3000"
+
+volumes:
+  qwen-omni-cache:

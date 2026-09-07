@@ -2,16 +2,14 @@ use crate::{
     config::{MonitorConfig, ProcessingContext},
     data_access::DataAccess,
     error::ImageAnalysisError,
+    file_processing::process_asset,
     health::mark_activity,
     host_manager::HostManager,
     immich_api::ImmichApiProvider,
-    prompt_enricher::enrich_prompt_if_needed,
-    utils::{
-        OverwriteDecision, build_final_description, check_overwrite_policy,
-        extract_uuid_from_preview_filename, filename_from_path, is_preview_filename,
-    },
+    utils::{extract_uuid_from_preview_filename, filename_from_path, is_preview_filename},
+    video_analysis::VideoAnalyzer,
 };
-use log::{error, warn};
+use log::error;
 use notify::{
     event::ModifyKind,
     {Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _},
@@ -40,8 +38,6 @@ pub async fn process_new_file(
     file_write_timeout: u64,
     file_check_interval: u64,
 ) -> Result<(), ImageAnalysisError> {
-    let data_access = ctx.data_access;
-
     let filename = filename_from_path(preview_path);
     println!(
         "{}",
@@ -80,58 +76,26 @@ pub async fn process_new_file(
     );
     let asset_id = extract_uuid_from_preview_filename(&filename)?;
 
-    let existing_description =
-        match check_overwrite_policy(ctx.data_access, &asset_id, ctx.overwrite_policy).await {
-            Ok(OverwriteDecision::Skip) => {
-                println!(
-                    "{}",
-                    rust_i18n::t!("monitor.file_already_in_db", filename = filename)
-                );
-                return Ok(());
-            }
-            Ok(OverwriteDecision::AnalyzeFresh) => None,
-            Ok(OverwriteDecision::PreserveExisting(desc)) => Some(desc),
-            Err(err) => return Err(err),
-        };
-
-    let final_prompt = enrich_prompt_if_needed(ctx, &asset_id)
-        .await
-        .unwrap_or_else(|| ctx.prompt.to_owned());
-
-    let result = ctx
-        .host_manager
-        .analyze_image(preview_path, &final_prompt)
-        .await;
-
-    match result {
-        Ok(analysis) => {
+    match process_asset(ctx, asset_id).await {
+        Ok(_) => {
             println!(
                 "{}",
                 rust_i18n::t!("monitor.processing_success", filename = filename)
             );
-
-            let final_description = build_final_description(
-                &analysis,
-                data_access,
-                ctx.preserve_human,
-                existing_description,
-                ctx.disable_ai_wrapper,
-            )
-            .await?;
-
-            data_access
-                .update_description(&analysis.asset_id, &final_description)
-                .await?;
             println!(
                 "{}",
                 rust_i18n::t!("monitor.database_updated", filename = filename)
             );
             Ok(())
         }
-        Err(err) => {
-            eprintln!("{}", err.user_message());
-            Err(err)
+        Err(ImageAnalysisError::AlreadyProcessed { .. }) => {
+            println!(
+                "{}",
+                rust_i18n::t!("monitor.file_already_in_db", filename = filename)
+            );
+            Ok(())
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -147,6 +111,7 @@ pub async fn monitor_folder(
     data_access: DataAccess,
     prompt: &str,
     config: &MonitorConfig,
+    video_analyzer: Option<Arc<VideoAnalyzer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     rust_i18n::set_locale(&config.lang);
     let http_client = Client::builder()
@@ -192,6 +157,7 @@ pub async fn monitor_folder(
         data_access: data_access.clone(),
         prompt: prompt.to_owned(),
         host_manager,
+        video_analyzer,
     };
 
     match &data_access {
@@ -295,6 +261,7 @@ struct BackgroundCtx {
     data_access: DataAccess,
     prompt: String,
     host_manager: Arc<HostManager>,
+    video_analyzer: Option<Arc<VideoAnalyzer>>,
 }
 
 fn handle_fs_events(
@@ -380,6 +347,7 @@ fn handle_fs_events(
                                 config_clone.enrich_prompt,
                                 config_clone.preserve_human,
                                 config_clone.disable_ai_wrapper,
+                                bg_ctx_clone.video_analyzer.as_deref(),
                             );
                             let result = process_new_file(
                                 &ctx,
@@ -484,19 +452,6 @@ async fn handle_api_poll(
                     tokio::spawn(async move {
                         rust_i18n::set_locale(&config_clone.lang);
 
-                        let preview_path =
-                            match bg_ctx_clone.data_access.get_preview_path(&asset_id).await {
-                                Ok(path) => path,
-                                Err(err) => {
-                                    error!("Failed to get preview for asset {asset_id}: {err}");
-                                    processing_assets_clone
-                                        .lock()
-                                        .expect("Failed to lock processing assets")
-                                        .remove(&asset_id);
-                                    return;
-                                }
-                            };
-
                         let ctx = ProcessingContext::new(
                             &bg_ctx_clone.data_access,
                             &bg_ctx_clone.prompt,
@@ -505,23 +460,10 @@ async fn handle_api_poll(
                             config_clone.enrich_prompt,
                             config_clone.preserve_human,
                             config_clone.disable_ai_wrapper,
+                            bg_ctx_clone.video_analyzer.as_deref(),
                         );
 
-                        let result = process_new_file(
-                            &ctx,
-                            &preview_path,
-                            config_clone.file_write_timeout,
-                            config_clone.file_check_interval,
-                        )
-                        .await;
-
-                        if let Err(err) = bg_ctx_clone
-                            .data_access
-                            .cleanup_preview(&preview_path)
-                            .await
-                        {
-                            warn!("Failed to cleanup preview: {err}");
-                        }
+                        let result = process_asset(&ctx, asset_id).await;
 
                         {
                             let mut processing = processing_assets_clone

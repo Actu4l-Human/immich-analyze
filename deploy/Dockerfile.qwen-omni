@@ -1,0 +1,6 @@
+FROM vllm/vllm-omni:v0.28.0
+
+# Rebind the promoted INC parser before module-name mapping. The build also
+# checks that expert layers stay quantized while router gates stay in BF16.
+COPY deploy/fix_inc_parser.py /tmp/fix_inc_parser.py
+RUN python /tmp/fix_inc_parser.py && rm /tmp/fix_inc_parser.py

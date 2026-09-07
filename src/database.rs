@@ -5,6 +5,7 @@ use crate::{
 };
 use log::{debug, warn};
 use serde::Serialize;
+use std::path::PathBuf;
 use tokio_postgres::Client as PgClient;
 use uuid::Uuid;
 
@@ -154,6 +155,31 @@ pub async fn update_or_create_asset_description(
             })
         }
     }
+}
+/// Gets the original path for an asset from the database.
+pub async fn get_original_path(
+    client: &PgClient,
+    asset_id: Uuid,
+) -> Result<PathBuf, ImageAnalysisError> {
+    let query = r#"SELECT "originalPath" FROM asset WHERE id = $1"#;
+    let query_result = client.query_opt(query, &[&asset_id]).await.map_err(|err| {
+        ImageAnalysisError::DatabaseError {
+            error: format!("Failed to query original path: {err}"),
+        }
+    })?;
+
+    let Some(row) = query_result else {
+        return Err(ImageAnalysisError::AssetNotFound { asset_id });
+    };
+
+    let stored_path: Option<String> = row.get(0);
+    let Some(original_path) = stored_path.filter(|path| !path.trim().is_empty()) else {
+        return Err(ImageAnalysisError::InvalidImmichStructure {
+            error: format!("Asset {asset_id} is missing originalPath"),
+        });
+    };
+
+    Ok(PathBuf::from(original_path))
 }
 
 /// Gets full metadata for an asset from the database for prompt enrichment.

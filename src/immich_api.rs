@@ -5,8 +5,11 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+use tokio::io::AsyncWriteExt as _;
 use url::Url;
 use uuid::Uuid;
 
@@ -386,6 +389,152 @@ impl ImmichApiProvider {
         Ok(all_assets)
     }
 
+    async fn remove_partial_download(destination: &Path) -> Result<(), ImageAnalysisError> {
+        match tokio::fs::remove_file(destination).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(ImageAnalysisError::IoError {
+                path: destination.display().to_string(),
+                error: format_error_chain(&err),
+            }),
+        }
+    }
+
+    /// Downloads the original asset file to the specified destination.
+    ///
+    /// Tries all API keys until one succeeds.
+    pub async fn download_original(
+        &self,
+        asset_id: &Uuid,
+        destination: &Path,
+        max_bytes: u64,
+        timeout: Duration,
+    ) -> Result<(), ImageAnalysisError> {
+        let url = self
+            .base_url
+            .join(&format!("/api/assets/{asset_id}/original"))
+            .map_err(|err| ImageAnalysisError::InvalidConfig {
+                error: format_error_chain(&err),
+            })?;
+        let filename = asset_id.to_string();
+
+        let mut last_error = None;
+        for client in &self.clients {
+            Self::remove_partial_download(destination).await?;
+
+            let response_result = client.get(url.clone()).timeout(timeout).send().await;
+            let mut response = match response_result {
+                Ok(resp) => resp,
+                Err(err) => {
+                    last_error = Some(ImageAnalysisError::HttpError {
+                        status: 0,
+                        filename: filename.clone(),
+                        response: format_error_chain(&err),
+                    });
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                last_error = Some(ImageAnalysisError::HttpError {
+                    status,
+                    filename: filename.clone(),
+                    response: response.status().to_string(),
+                });
+                continue;
+            }
+
+            if let Some(content_length) = response.content_length()
+                && content_length > max_bytes
+            {
+                Self::remove_partial_download(destination).await?;
+                return Err(ImageAnalysisError::ProcessingError {
+                    filename: filename.clone(),
+                    error: format!(
+                        "Original file exceeds the configured maximum of {max_bytes} bytes (Content-Length: {content_length} bytes)"
+                    ),
+                });
+            }
+
+            let transfer = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(destination)
+                    .await
+                    .map_err(|err| ImageAnalysisError::ProcessingError {
+                        filename: filename.clone(),
+                        error: format_error_chain(&err),
+                    })?;
+                let mut downloaded = 0_u64;
+                while let Some(chunk) = response.chunk().await.map_err(|err| {
+                    ImageAnalysisError::HttpError {
+                        status: 0,
+                        filename: filename.clone(),
+                        response: format_error_chain(&err),
+                    }
+                })? {
+                    let chunk_len = u64::try_from(chunk.len()).map_err(|err| {
+                        ImageAnalysisError::ProcessingError {
+                            filename: filename.clone(),
+                            error: format_error_chain(&err),
+                        }
+                    })?;
+                    downloaded = downloaded.checked_add(chunk_len).ok_or_else(|| {
+                        ImageAnalysisError::ProcessingError {
+                            filename: filename.clone(),
+                            error: "Original file size overflowed u64".to_owned(),
+                        }
+                    })?;
+                    if downloaded > max_bytes {
+                        return Err(ImageAnalysisError::ProcessingError {
+                            filename: filename.clone(),
+                            error: format!(
+                                "Original file exceeds the configured maximum of {max_bytes} bytes after {downloaded} bytes"
+                            ),
+                        });
+                    }
+                    file.write_all(&chunk).await.map_err(|err| {
+                        ImageAnalysisError::ProcessingError {
+                            filename: filename.clone(),
+                            error: format_error_chain(&err),
+                        }
+                    })?;
+                }
+                if downloaded == 0 {
+                    return Err(ImageAnalysisError::EmptyFile {
+                        filename: filename.clone(),
+                    });
+                }
+                file.flush().await.map_err(|err| ImageAnalysisError::ProcessingError {
+                    filename: filename.clone(),
+                    error: format_error_chain(&err),
+                })?;
+                Ok(())
+            }.await;
+
+            match transfer {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    Self::remove_partial_download(destination).await?;
+                    if matches!(&err, ImageAnalysisError::HttpError { .. }) {
+                        last_error = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Self::remove_partial_download(destination).await?;
+        Err(last_error.unwrap_or_else(|| ImageAnalysisError::HttpError {
+            status: 0,
+            filename: filename.clone(),
+            response: "No API keys available".to_owned(),
+        }))
+    }
+
     /// Gets the filesystem path to the preview image for an asset.
     ///
     /// For API mode, this downloads the preview to a temporary file and returns its path.
@@ -692,5 +841,159 @@ impl ImmichApiProvider {
             filename: asset_id.to_string(),
             response: "No API keys available".to_owned(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImmichApiProvider;
+    use crate::error::ImageAnalysisError;
+    use std::{net::SocketAddr, time::Duration};
+    use tempfile::tempdir;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
+    };
+    use uuid::Uuid;
+
+    async fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let read = stream.read(&mut chunk).await.expect("request read");
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(
+                chunk
+                    .get(..read)
+                    .expect("read length is bounded by its buffer"),
+            );
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8(buf).expect("utf8 request")
+    }
+
+    fn accept_once(
+        listener: TcpListener,
+        response: &'static [u8],
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.contains("GET /api/assets/"));
+            assert!(request.contains("x-api-key: "));
+            stream.write_all(response).await.expect("write response");
+            stream.shutdown().await.expect("shutdown");
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn download_original_rejects_overlimit_chunked_body_and_cleans_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (addr, handle) = accept_once(
+            listener,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n3\r\ncde\r\n",
+        );
+        let provider = ImmichApiProvider::new(&format!("http://{addr}"), &[String::from("key")])
+            .expect("provider");
+        let tempdir = tempdir().expect("tempdir");
+        let destination = tempdir.path().join("original.bin");
+
+        let err = provider
+            .download_original(
+                &Uuid::from_u128(42),
+                &destination,
+                4,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("expected overlimit");
+
+        handle.await.expect("server task");
+
+        assert!(matches!(err, ImageAnalysisError::ProcessingError { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn download_original_retries_after_partial_transfer_and_preserves_second_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream1, _) = listener.accept().await.expect("accept first");
+            let request1 = read_http_request(&mut stream1).await;
+            assert!(request1.contains("x-api-key: key-one"));
+            stream1
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n")
+                .await
+                .expect("write partial");
+            stream1.shutdown().await.expect("shutdown first");
+
+            let (mut stream2, _) = listener.accept().await.expect("accept second");
+            let request2 = read_http_request(&mut stream2).await;
+            assert!(request2.contains("x-api-key: key-two"));
+            stream2
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nWXYZ")
+                .await
+                .expect("write second");
+            stream2.shutdown().await.expect("shutdown second");
+        });
+
+        let provider = ImmichApiProvider::new(
+            &format!("http://{addr}"),
+            &[String::from("key-one"), String::from("key-two")],
+        )
+        .expect("provider");
+        let tempdir = tempdir().expect("tempdir");
+        let destination = tempdir.path().join("original.bin");
+
+        provider
+            .download_original(
+                &Uuid::from_u128(42),
+                &destination,
+                16,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("second key should succeed");
+
+        handle.await.expect("server task");
+
+        let bytes = tokio::fs::read(&destination)
+            .await
+            .expect("read downloaded");
+        assert_eq!(bytes, b"WXYZ");
+    }
+
+    #[tokio::test]
+    async fn download_original_returns_empty_file_for_empty_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (addr, handle) = accept_once(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let provider = ImmichApiProvider::new(&format!("http://{addr}"), &[String::from("key")])
+            .expect("provider");
+        let tempdir = tempdir().expect("tempdir");
+        let destination = tempdir.path().join("original.bin");
+
+        let err = provider
+            .download_original(
+                &Uuid::from_u128(42),
+                &destination,
+                16,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("expected empty file");
+
+        handle.await.expect("server task");
+
+        assert!(matches!(err, ImageAnalysisError::EmptyFile { .. }));
+        assert!(!destination.exists());
     }
 }

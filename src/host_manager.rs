@@ -1,11 +1,9 @@
 use crate::{
     args::Interface,
     error::ImageAnalysisError,
-    utils::{
-        extract_uuid_from_preview_filename, filename_from_path, format_error_chain,
-        read_image_as_base64,
-    },
+    utils::{format_error_chain, read_image_as_base64},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::Value;
@@ -196,10 +194,11 @@ impl HostManager {
 
     pub async fn analyze_image(
         &self,
+        asset_id: uuid::Uuid,
         image_path: &Path,
         prompt: &str,
     ) -> Result<crate::database::ImageAnalysisResult, ImageAnalysisError> {
-        let filename = filename_from_path(image_path);
+        let filename = asset_id.to_string();
 
         info!(
             "Starting {:?} analysis for image: {}",
@@ -207,23 +206,131 @@ impl HostManager {
         );
         debug!("Model: {}, Timeout: {}s", self.model_name, self.timeout);
 
-        let asset_id = extract_uuid_from_preview_filename(&filename)?;
         let base64_image = read_image_as_base64(image_path, &filename).await?;
-
         let request_body =
             self.interface
                 .build_request_body(&self.model_name, prompt, &base64_image);
 
-        let endpoint = self.interface.endpoint();
+        self.execute_request(asset_id, &filename, &request_body, false)
+            .await
+    }
 
+    pub async fn analyze_video_chunk(
+        &self,
+        asset_id: uuid::Uuid,
+        clip_path: &Path,
+        prompt: &str,
+        has_audio: bool,
+    ) -> Result<crate::database::ImageAnalysisResult, ImageAnalysisError> {
+        const MAX_VIDEO_CLIP_BYTES: u64 = 16 * 1024 * 1024;
+
+        let filename = asset_id.to_string();
+
+        info!(
+            "Starting {:?} analysis for video: {}",
+            self.interface, filename
+        );
+        debug!("Model: {}, Timeout: {}s", self.model_name, self.timeout);
+
+        let metadata = tokio::fs::metadata(clip_path).await.map_err(|err| {
+            ImageAnalysisError::ProcessingError {
+                filename: filename.clone(),
+                error: format_error_chain(&err),
+            }
+        })?;
+        if metadata.len() == 0 {
+            return Err(ImageAnalysisError::EmptyFile {
+                filename: filename.clone(),
+            });
+        }
+        if metadata.len() > MAX_VIDEO_CLIP_BYTES {
+            return Err(ImageAnalysisError::ProcessingError {
+                filename: filename.clone(),
+                error: format!(
+                    "Video clip is {} bytes, which exceeds the {}-byte limit",
+                    metadata.len(),
+                    MAX_VIDEO_CLIP_BYTES
+                ),
+            });
+        }
+
+        let clip_bytes = tokio::fs::read(clip_path).await.map_err(|err| {
+            ImageAnalysisError::ProcessingError {
+                filename: filename.clone(),
+                error: format_error_chain(&err),
+            }
+        })?;
+        if clip_bytes.is_empty() {
+            return Err(ImageAnalysisError::EmptyFile {
+                filename: filename.clone(),
+            });
+        }
+        if clip_bytes.len() as u64 > MAX_VIDEO_CLIP_BYTES {
+            return Err(ImageAnalysisError::ProcessingError {
+                filename: filename.clone(),
+                error: format!(
+                    "Video clip is {} bytes, which exceeds the {}-byte limit",
+                    clip_bytes.len(),
+                    MAX_VIDEO_CLIP_BYTES
+                ),
+            });
+        }
+
+        let request_body = serde_json::json!({
+            "model": self.model_name.as_str(),
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": format!("data:video/mp4;base64,{}", STANDARD.encode(&clip_bytes))
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    }
+                ]
+            }],
+            "modalities": ["text"],
+            "media_io_kwargs": {
+                "video": {
+                    "video_backend": "opencv",
+                    "backend": "pyav",
+                    "num_frames": 32_u32,
+                    "fps": -1_i32,
+                }
+            },
+            "mm_processor_kwargs": {
+                "use_audio_in_video": has_audio,
+            },
+            "max_tokens": 512_u32,
+            "stream": false,
+        });
+        drop(clip_bytes);
+
+        self.execute_request(asset_id, &filename, &request_body, true)
+            .await
+    }
+
+    async fn execute_request(
+        &self,
+        asset_id: uuid::Uuid,
+        filename: &str,
+        request_body: &Value,
+        reject_truncated: bool,
+    ) -> Result<crate::database::ImageAnalysisResult, ImageAnalysisError> {
+        let endpoint = self.interface.endpoint();
         let mut attempt: u32 = 0;
         let mut last_error = None;
+
         loop {
             attempt = attempt.saturating_add(1);
 
             if self.max_retries.is_some() || attempt > 1 {
                 info!(
-                    "Retry attempt {}/{} for image {}",
+                    "Retry attempt {}/{} for asset {}",
                     attempt,
                     self.max_retries
                         .map_or_else(|| "∞".to_owned(), |max| max.to_string()),
@@ -231,7 +338,6 @@ impl HostManager {
                 );
             }
 
-            // Try each available host until we get a successful response
             for _ in 0..self.hosts.len() {
                 let host = match self.get_available_host() {
                     Ok(host) => host,
@@ -247,7 +353,7 @@ impl HostManager {
                 let url = format!("{}{}", host.trim_end_matches('/'), endpoint);
                 info!("Making {:?} request to: {}", self.interface, url);
 
-                let mut request = self.client.post(&url).json(&request_body);
+                let mut request = self.client.post(&url).json(request_body);
 
                 if self.interface.supports_bearer_auth() {
                     if let Some(api_key) = &self.api_key {
@@ -280,7 +386,7 @@ impl HostManager {
                             let response_text = response.text().await.map_err(|err| {
                                 error!("Failed to read response body: {err}");
                                 ImageAnalysisError::ProcessingError {
-                                    filename: filename.clone(),
+                                    filename: filename.to_owned(),
                                     error: format_error_chain(&err),
                                 }
                             })?;
@@ -289,14 +395,28 @@ impl HostManager {
 
                             match serde_json::from_str::<Value>(&response_text) {
                                 Ok(json_value) => {
+                                    if reject_truncated
+                                        && matches!(
+                                            Self::response_finish_reason(&json_value),
+                                            Some("length")
+                                        )
+                                    {
+                                        return Err(ImageAnalysisError::ProcessingError {
+                                            filename: filename.to_owned(),
+                                            error:
+                                                "AI response was truncated (finish_reason=length)"
+                                                    .to_owned(),
+                                        });
+                                    }
+
                                     let content = self.interface.parse_response(&json_value);
 
                                     if let Some(raw_description) = content {
                                         let description = raw_description.trim().to_owned();
                                         if description.is_empty() {
-                                            warn!("Empty response for image: {filename}");
+                                            warn!("Empty response for asset: {filename}");
                                             last_error = Some(ImageAnalysisError::EmptyResponse {
-                                                filename: filename.clone(),
+                                                filename: filename.to_owned(),
                                             });
                                         } else {
                                             info!(
@@ -315,7 +435,7 @@ impl HostManager {
                                             "Failed to extract content from response for {filename}"
                                         );
                                         last_error = Some(ImageAnalysisError::JsonParsing {
-                                            filename: filename.clone(),
+                                            filename: filename.to_owned(),
                                             error: "No content field found in response".to_owned(),
                                         });
                                     }
@@ -325,7 +445,7 @@ impl HostManager {
                                         "Failed to parse response as JSON for {filename}: {parse_error}"
                                     );
                                     let error = ImageAnalysisError::JsonParsing {
-                                        filename: filename.clone(),
+                                        filename: filename.to_owned(),
                                         error: format_error_chain(&parse_error),
                                     };
                                     if !error.is_retryable() {
@@ -343,7 +463,7 @@ impl HostManager {
                             );
                             let error = ImageAnalysisError::HttpError {
                                 status,
-                                filename: filename.clone(),
+                                filename: filename.to_owned(),
                                 response: response_text,
                             };
                             if !error.is_retryable() {
@@ -359,7 +479,7 @@ impl HostManager {
                         );
                         last_error = Some(ImageAnalysisError::HttpError {
                             status: 0,
-                            filename: filename.clone(),
+                            filename: filename.to_owned(),
                             response: format_error_chain(&err),
                         });
                     }
@@ -391,6 +511,98 @@ impl HostManager {
                 break;
             }
         }
+
         Err(last_error.unwrap_or(ImageAnalysisError::AllHostsUnavailable))
+    }
+
+    fn response_finish_reason(json_value: &Value) -> Option<&str> {
+        json_value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostManager, Interface};
+    use crate::error::ImageAnalysisError;
+    use std::{error::Error, num::NonZeroU32, time::Duration};
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn truncated_video_is_rejected_without_changing_image_completion_behavior()
+    -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let host = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            for _ in 0..2_u8 {
+                let (stream, _) = listener.accept().await?;
+                let mut reader = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await? == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value
+                            .trim()
+                            .parse::<usize>()
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).await?;
+                let response_body = r#"{"choices":[{"message":{"content":"partial model output"},"finish_reason":"length"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                reader.get_mut().write_all(response.as_bytes()).await?;
+                reader.get_mut().shutdown().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let manager = HostManager::new(
+            vec![host],
+            Interface::Llamacpp,
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()?,
+            "fixture".to_owned(),
+            2,
+            NonZeroU32::new(1),
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+        );
+        let media = tempfile::NamedTempFile::new()?;
+        tokio::fs::write(media.path(), b"transport fixture bytes").await?;
+        let asset_id = Uuid::from_u128(42);
+
+        let video = manager
+            .analyze_video_chunk(asset_id, media.path(), "Describe", true)
+            .await;
+        assert!(matches!(
+            video,
+            Err(ImageAnalysisError::ProcessingError { .. })
+        ));
+        let image = manager
+            .analyze_image(asset_id, media.path(), "Describe")
+            .await?;
+        assert_eq!(image.asset_id, asset_id);
+        assert_eq!(image.description, "partial model output");
+        tokio::time::timeout(Duration::from_secs(5), server).await???;
+        Ok(())
     }
 }

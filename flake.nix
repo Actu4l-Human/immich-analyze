@@ -15,7 +15,11 @@
       immich-analyze = naerskLib.buildPackage {
         src = ./.;
         buildInputs = with pkgs; [ openssl ];
-        nativeBuildInputs = [ pkgs.pkg-config ];
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
+        postInstall = ''
+          wrapProgram "$out/bin/immich-analyze" \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}
+        '';
       };
     in {
       packages.default = immich-analyze;
@@ -27,6 +31,7 @@
           fish
           cargo rustc rustfmt clippy rust-analyzer
           openssl
+          ffmpeg
         ];
         nativeBuildInputs = [ pkgs.pkg-config ];
 

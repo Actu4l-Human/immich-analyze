@@ -2,6 +2,7 @@ use crate::{
     args::{Args, Interface, OverwritePolicy},
     data_access::DataAccess,
     host_manager::HostManager,
+    video_analysis::VideoAnalyzer,
 };
 use std::num::NonZeroU32;
 
@@ -58,10 +59,15 @@ pub struct ProcessingContext<'a> {
     pub enrich_prompt: bool,
     pub preserve_human: bool,
     pub disable_ai_wrapper: bool,
+    pub video_analyzer: Option<&'a VideoAnalyzer>,
 }
 
 impl<'a> ProcessingContext<'a> {
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Context constructor mirrors the existing policy flags and shared analyzers"
+    )]
     pub const fn new(
         data_access: &'a DataAccess,
         prompt: &'a str,
@@ -70,6 +76,7 @@ impl<'a> ProcessingContext<'a> {
         enrich_prompt: bool,
         preserve_human: bool,
         disable_ai_wrapper: bool,
+        video_analyzer: Option<&'a VideoAnalyzer>,
     ) -> Self {
         Self {
             data_access,
@@ -79,6 +86,7 @@ impl<'a> ProcessingContext<'a> {
             enrich_prompt,
             preserve_human,
             disable_ai_wrapper,
+            video_analyzer,
         }
     }
 }

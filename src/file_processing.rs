@@ -7,11 +7,11 @@ use crate::{
     host_manager::HostManager,
     immich_api::AssetRef,
     progress::SimpleProgress,
-    prompt_enricher::enrich_prompt_if_needed,
+    prompt_enricher::{enrich_prompt, enrich_prompt_if_needed},
     utils::{
-        OverwriteDecision, build_final_description, check_overwrite_policy,
-        extract_uuid_from_preview_filename, filename_from_path, is_preview_filename,
+        OverwriteDecision, build_final_description, check_overwrite_policy, is_preview_filename,
     },
+    video_analysis::VideoAnalyzer,
 };
 use futures::stream::{self, StreamExt as _};
 use log::{error, warn};
@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Get all preview image files from Immich thumbs directory.
 ///
@@ -74,45 +75,63 @@ pub async fn get_immich_preview_files(
     Ok(preview_files)
 }
 
-async fn process_file_with_existing_check(
+pub async fn process_asset(
     ctx: &ProcessingContext<'_>,
-    path: &Path,
-) -> Result<ImageAnalysisResult, ImageAnalysisError> {
-    let filename = filename_from_path(path);
-    let asset_id = extract_uuid_from_preview_filename(&filename)?;
-
-    match check_overwrite_policy(ctx.data_access, &asset_id, ctx.overwrite_policy).await? {
-        OverwriteDecision::Skip => Err(ImageAnalysisError::AlreadyProcessed { filename }),
-        OverwriteDecision::AnalyzeFresh => process_file(ctx, path, None).await,
-        OverwriteDecision::PreserveExisting(desc) => process_file(ctx, path, Some(desc)).await,
-    }
-}
-
-async fn process_file(
-    ctx: &ProcessingContext<'_>,
-    path: &Path,
-    existing_description: Option<String>,
+    asset_id: Uuid,
 ) -> Result<ImageAnalysisResult, ImageAnalysisError> {
     let data_access = ctx.data_access;
-
-    let filename = filename_from_path(path);
-
-    let asset_id = extract_uuid_from_preview_filename(&filename)?;
-
-    let preview_path = data_access.get_preview_path(&asset_id).await?;
-    let final_prompt = enrich_prompt_if_needed(ctx, &asset_id)
-        .await
-        .unwrap_or_else(|| ctx.prompt.to_owned());
-
-    let analysis = ctx
-        .host_manager
-        .analyze_image(&preview_path, &final_prompt)
-        .await?;
-
-    if let Err(err) = data_access.cleanup_preview(&preview_path).await {
-        warn!("Failed to cleanup preview: {err}");
-    }
-
+    let existing_description =
+        match check_overwrite_policy(data_access, &asset_id, ctx.overwrite_policy).await? {
+            OverwriteDecision::Skip => {
+                return Err(ImageAnalysisError::AlreadyProcessed {
+                    filename: asset_id.to_string(),
+                });
+            }
+            OverwriteDecision::AnalyzeFresh => None,
+            OverwriteDecision::PreserveExisting(description) => Some(description),
+        };
+    let (video_analyzer, asset_metadata) = if let Some(analyzer) = ctx.video_analyzer {
+        let metadata = data_access.get_asset_metadata(&asset_id).await?;
+        let selected = match metadata.r#type.as_deref() {
+            Some("VIDEO") => Some(analyzer),
+            Some("IMAGE") => None,
+            _ => {
+                return Err(ImageAnalysisError::ProcessingError {
+                    filename: asset_id.to_string(),
+                    error: "Asset type is missing or unsupported for media analysis".to_owned(),
+                });
+            }
+        };
+        (selected, Some(metadata))
+    } else {
+        (None, None)
+    };
+    let base_prompt = video_analyzer.map_or(ctx.prompt, VideoAnalyzer::prompt);
+    let final_prompt = if ctx.enrich_prompt {
+        match asset_metadata {
+            Some(metadata) => enrich_prompt(base_prompt, metadata),
+            None => enrich_prompt_if_needed(ctx, &asset_id)
+                .await
+                .unwrap_or_else(|| base_prompt.to_owned()),
+        }
+    } else {
+        base_prompt.to_owned()
+    };
+    let analysis = if let Some(analyzer) = video_analyzer {
+        analyzer
+            .analyze(data_access, asset_id, &final_prompt)
+            .await?
+    } else {
+        let preview = data_access.get_preview_path(&asset_id).await?;
+        let result = ctx
+            .host_manager
+            .analyze_image(asset_id, &preview, &final_prompt)
+            .await;
+        if let Err(err) = data_access.cleanup_preview(&preview).await {
+            warn!("Failed to cleanup preview: {err}");
+        }
+        result?
+    };
     let final_description = build_final_description(
         &analysis,
         data_access,
@@ -121,11 +140,9 @@ async fn process_file(
         ctx.disable_ai_wrapper,
     )
     .await?;
-
     data_access
-        .update_description(&analysis.asset_id, &final_description)
+        .update_description(&asset_id, &final_description)
         .await?;
-
     Ok(analysis)
 }
 
@@ -136,6 +153,7 @@ pub async fn process_files_concurrently(
     args: &crate::args::Args,
     locale: &str,
     progress: Arc<Mutex<SimpleProgress>>,
+    video_analyzer: Option<&VideoAnalyzer>,
 ) -> Vec<(String, Result<ImageAnalysisResult, ImageAnalysisError>)> {
     // Create host manager once for all files to preserve unavailable host state
     let unavailable_duration = Duration::from_secs(args.unavailable_duration);
@@ -163,24 +181,7 @@ pub async fn process_files_concurrently(
         async move {
             rust_i18n::set_locale(&lang);
             mark_activity();
-            let preview_path = match data_access.get_preview_path(&asset_id).await {
-                Ok(preview_path) => preview_path,
-                Err(err) => {
-                    let filename = asset_id.to_string();
-                    progress_clone
-                        .lock()
-                        .await
-                        .set_message(&rust_i18n::t!("progress.error", filename = filename));
-
-                    progress_clone
-                        .lock()
-                        .await
-                        .set_message_and_inc(&rust_i18n::t!("progress.error", filename = filename));
-
-                    return (filename, Err(err));
-                }
-            };
-            let filename = filename_from_path(&preview_path);
+            let filename = asset_id.to_string();
             progress_clone
                 .lock()
                 .await
@@ -194,9 +195,10 @@ pub async fn process_files_concurrently(
                 args.enrich_prompt,
                 args.preserve_human,
                 args.disable_ai_wrapper,
+                video_analyzer,
             );
 
-            let result = process_file_with_existing_check(&ctx, &preview_path).await;
+            let result = process_asset(&ctx, asset_id).await;
             match &result {
                 Err(
                     ImageAnalysisError::AlreadyProcessed { .. }

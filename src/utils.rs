@@ -7,7 +7,51 @@ use log::warn;
 use regex::Regex;
 use std::{borrow::Cow, error::Error, path::Path, str::FromStr as _, sync::OnceLock};
 use tokio::io::AsyncReadExt as _;
+use url::Url;
 use uuid::Uuid;
+fn validate_video_host(host: &str) -> Result<(), ImageAnalysisError> {
+    if host.trim().is_empty() {
+        return Err(ImageAnalysisError::InvalidConfig {
+            error: "Video host list contains an empty element".to_owned(),
+        });
+    }
+
+    let url = Url::parse(host).map_err(|err| ImageAnalysisError::InvalidConfig {
+        error: format!("Invalid video host URL: {}", format_error_chain(&err)),
+    })?;
+
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(ImageAnalysisError::InvalidConfig {
+                error: format!("Video host must use http or https, found {scheme}"),
+            });
+        }
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ImageAnalysisError::InvalidConfig {
+            error: "Video host must not include userinfo".to_owned(),
+        });
+    }
+
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ImageAnalysisError::InvalidConfig {
+            error: "Video host must not include query or fragment".to_owned(),
+        });
+    }
+
+    if matches!(
+        url.path().rsplit('/').find(|segment| !segment.is_empty()),
+        Some("v1")
+    ) {
+        return Err(ImageAnalysisError::InvalidConfig {
+            error: "Video host must not end with /v1 because /v1/chat/completions is appended automatically".to_owned(),
+        });
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverwriteDecision {
@@ -242,6 +286,44 @@ pub fn validate_args(args: &crate::args::Args) -> Result<(), Box<dyn Error>> {
         {
             println!("{}", rust_i18n::t!("warning.disable_ai_wrapper_missing_ai"));
         }
+
+        if args.video_hosts.is_empty() {
+            return Ok(());
+        }
+
+        if args.video_model_name.trim().is_empty() {
+            return Err(ImageAnalysisError::InvalidConfig {
+                error: "Video model name cannot be blank when video hosts are configured"
+                    .to_owned(),
+            }
+            .into());
+        }
+
+        if args.video_prompt.trim().is_empty() {
+            return Err(ImageAnalysisError::InvalidConfig {
+                error: "Video prompt cannot be blank when video hosts are configured".to_owned(),
+            }
+            .into());
+        }
+
+        if args.video_max_concurrent == 0 {
+            return Err(ImageAnalysisError::InvalidConfig {
+                error: "Video max concurrent must be greater than zero".to_owned(),
+            }
+            .into());
+        }
+
+        if args.video_max_bytes == 0 {
+            return Err(ImageAnalysisError::InvalidConfig {
+                error: "Video max bytes must be greater than zero".to_owned(),
+            }
+            .into());
+        }
+
+        for host in &args.video_hosts {
+            validate_video_host(host)?;
+        }
+
         Ok(())
     }
 }
@@ -278,4 +360,26 @@ pub fn format_error_chain(err: &dyn Error) -> String {
         source = inner.source();
     }
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_video_host;
+    use crate::error::ImageAnalysisError;
+
+    #[test]
+    fn video_host_validation_rejects_unsafe_urls_without_disclosing_credentials() {
+        assert!(matches!(
+            validate_video_host(""),
+            Err(ImageAnalysisError::InvalidConfig { .. })
+        ));
+        let error = validate_video_host("http://user:sentinel-password@example.com")
+            .expect_err("userinfo must be rejected");
+        assert!(matches!(&error, ImageAnalysisError::InvalidConfig { .. }));
+        assert!(!error.to_string().contains("sentinel-password"));
+        assert!(matches!(
+            validate_video_host("http://example.com/v1"),
+            Err(ImageAnalysisError::InvalidConfig { .. })
+        ));
+    }
 }
