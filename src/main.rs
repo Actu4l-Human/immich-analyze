@@ -1,7 +1,7 @@
 #![warn(non_ascii_idents)]
 
 use clap::Parser as _;
-use std::{path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
 use tokio_postgres::NoTls;
 
 mod args;
@@ -17,6 +17,7 @@ mod monitor;
 mod progress;
 mod prompt_enricher;
 mod utils;
+mod video_analysis;
 
 use args::{Args, OverwritePolicy};
 use config::MonitorConfig;
@@ -28,6 +29,7 @@ use utils::{
     determine_locale, format_error_chain, get_system_locale, validate_args,
     validate_immich_directory,
 };
+use video_analysis::VideoAnalyzer;
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -48,6 +50,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     validate_args(&args)?;
+    let video_analyzer = if args.video_hosts.is_empty() {
+        None
+    } else {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(args.timeout))
+            .build()?;
+        VideoAnalyzer::from_args(&args, client).await?.map(Arc::new)
+    };
 
     // Start health check HTTP server for Docker HEALTHCHECK
     let health_port = args.health_port;
@@ -126,11 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if args.combined {
-        run_combined_mode(args.clone(), &data_access, &final_locale).await?;
+        run_combined_mode(args.clone(), &data_access, &final_locale, video_analyzer).await?;
     } else if args.monitor {
-        run_monitor_mode(&args, &data_access, &final_locale).await?;
+        run_monitor_mode(&args, &data_access, &final_locale, video_analyzer).await?;
     } else {
-        run_batch_mode(&args, &data_access, &final_locale).await?;
+        run_batch_mode(&args, &data_access, &final_locale, video_analyzer).await?;
     }
 
     Ok(())
@@ -140,15 +150,24 @@ async fn run_combined_mode(
     args: Args,
     data_access: &DataAccess,
     locale: &str,
+    video_analyzer: Option<Arc<VideoAnalyzer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", rust_i18n::t!("main.combined_mode_activated"));
     let batch_handle = {
         let args_clone = args.clone();
         let data_access_clone = data_access.clone();
         let locale_clone = locale.to_owned();
+        let video_analyzer_clone = video_analyzer.clone();
         tokio::spawn(async move {
             println!("{}", rust_i18n::t!("main.processing_existing_images"));
-            if let Err(err) = run_batch_mode(&args_clone, &data_access_clone, &locale_clone).await {
+            if let Err(err) = run_batch_mode(
+                &args_clone,
+                &data_access_clone,
+                &locale_clone,
+                video_analyzer_clone,
+            )
+            .await
+            {
                 eprintln!(
                     "{}",
                     rust_i18n::t!(
@@ -164,7 +183,7 @@ async fn run_combined_mode(
         "{}",
         rust_i18n::t!("main.monitor_mode_started_in_background")
     );
-    run_monitor_mode(&args, data_access, locale).await?;
+    run_monitor_mode(&args, data_access, locale, video_analyzer).await?;
     let _: Result<(), tokio::task::JoinError> = batch_handle.await;
     Ok(())
 }
@@ -173,6 +192,7 @@ async fn run_monitor_mode(
     args: &Args,
     data_access: &DataAccess,
     locale: &str,
+    video_analyzer: Option<Arc<VideoAnalyzer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", rust_i18n::t!("main.monitor_mode_activated"));
     let overwrite_policy = args.effective_overwrite_policy();
@@ -187,6 +207,7 @@ async fn run_monitor_mode(
         data_access.clone(),
         &args.prompt,
         &monitor_config,
+        video_analyzer,
     )
     .await?;
     Ok(())
@@ -196,13 +217,19 @@ async fn run_batch_mode(
     args: &Args,
     data_access: &DataAccess,
     locale: &str,
+    video_analyzer: Option<Arc<VideoAnalyzer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         rust_i18n::t!("main.database_connected", path = "Immich data source")
     );
 
-    let assets = data_access.get_assets_to_process().await?;
+    let assets = {
+        let mut assets = data_access.get_assets_to_process().await?;
+        let mut seen = HashSet::with_capacity(assets.len());
+        assets.retain(|asset| seen.insert(asset.id));
+        assets
+    };
 
     println!(
         "{}",
@@ -239,8 +266,16 @@ async fn run_batch_mode(
         &rust_i18n::t!("progress.processing_complete"),
     )));
 
-    let results =
-        process_files_concurrently(assets, &http_client, data_access, args, locale, progress).await;
+    let results = process_files_concurrently(
+        assets,
+        &http_client,
+        data_access,
+        args,
+        locale,
+        progress,
+        video_analyzer.as_deref(),
+    )
+    .await;
 
     if !args.no_final_output {
         file_processing::display_results(&results, args.max_concurrent > 1);

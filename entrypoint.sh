@@ -93,6 +93,25 @@ if [ -n "$IMMICH_ANALYZE_PROMPT" ]; then
     args+=("--prompt" "$IMMICH_ANALYZE_PROMPT")
 fi
 
+# Video hosts enable original-video analysis. Keep numeric values verbatim so
+# invalid configuration is rejected by clap rather than silently ignored.
+if [ -n "$IMMICH_ANALYZE_VIDEO_HOSTS" ]; then
+    args+=("--video-hosts" "$IMMICH_ANALYZE_VIDEO_HOSTS")
+fi
+if [ -n "$IMMICH_ANALYZE_VIDEO_MODEL_NAME" ]; then
+    args+=("--video-model-name" "$IMMICH_ANALYZE_VIDEO_MODEL_NAME")
+fi
+if [ -n "$IMMICH_ANALYZE_VIDEO_PROMPT" ]; then
+    args+=("--video-prompt" "$IMMICH_ANALYZE_VIDEO_PROMPT")
+fi
+if [ -n "$IMMICH_ANALYZE_VIDEO_MAX_CONCURRENT" ]; then
+    args+=("--video-max-concurrent" "$IMMICH_ANALYZE_VIDEO_MAX_CONCURRENT")
+fi
+if [ -n "$IMMICH_ANALYZE_VIDEO_MAX_BYTES" ]; then
+    args+=("--video-max-bytes" "$IMMICH_ANALYZE_VIDEO_MAX_BYTES")
+fi
+# IMMICH_ANALYZE_VIDEO_API_KEY is read directly from env by clap.
+
 if [ -n "$IMMICH_ANALYZE_OVERWRITE_POLICY" ]; then
     args+=("--overwrite-policy" "$IMMICH_ANALYZE_OVERWRITE_POLICY")
 elif [ "${IMMICH_ANALYZE_OVERWRITE_EXISTING:-false}" = "true" ]; then

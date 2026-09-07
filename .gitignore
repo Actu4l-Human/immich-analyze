@@ -3,3 +3,6 @@
 gptree_output.txt
 .qwen
 QWEN.md
+/.env
+/.env.*
+!/.env.example

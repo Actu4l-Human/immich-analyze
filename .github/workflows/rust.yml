@@ -31,6 +31,9 @@ jobs:
       - name: Build
         run: nix develop . --command cargo build --verbose
 
+      - name: Test
+        run: NO_AUTO_FISH=1 nix develop . --command cargo test --locked
+
       - name: Build release
         run: nix develop . --command cargo build --release --verbose
 

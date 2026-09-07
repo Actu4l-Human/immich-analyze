@@ -1,10 +1,10 @@
 # Immich Analyze
 
-AI-powered image description generator for Immich photo management system
+AI-powered image and audiovisual description generator for Immich
 
 ## Overview
 
-Immich Analyze automatically generates detailed descriptions for images in your Immich library using AI vision models via **Ollama** or **llama.cpp server**. This enhances search capabilities and organization by providing semantic understanding of image content.
+Immich Analyze generates searchable descriptions for images and videos in your Immich library. Images can use **Ollama** or an **OpenAI-compatible vision server**; opt-in video analysis uses **self-hosted Qwen3-Omni** to understand visual events, speech, music, and environmental sounds. The included Docker Compose stack runs inference locally and connects to a remote Immich server over its REST API.
 
 The application supports two data access modes:
 - **Database mode**: Direct PostgreSQL database access for reading/writing Immich metadata. Note: this mode is planned for removal in a future release (0.5.0 or 0.6.0) since the Immich team does not support direct database access, and schema changes may break compatibility without notice.
@@ -13,6 +13,7 @@ The application supports two data access modes:
 ## Features
 
 - AI-powered image analysis using Ollama or llama.cpp server with vision-capable models
+- Full-duration video analysis in bounded, timestamped segments, including the video's audio track
 - Multiple operation modes: batch processing, folder monitoring, or combined mode
 - Multi-host support with automatic failover for AI service endpoints
 - **Dual data access modes**: Direct PostgreSQL database access OR Immich API integration (database mode is planned for removal in 0.5.0 or 0.6.0)
@@ -33,10 +34,89 @@ The application supports two data access modes:
 - AI service running a vision-capable model:
   - **Ollama** server (e.g., `qwen3-vl:4b-thinking-q4_K_M`), OR
   - **llama.cpp server** with OpenAI-compatible API endpoint
+  - **vLLM-Omni** for audiovisual analysis; the included Compose setup supplies it locally
 
 ## Installation
 
-### Docker Compose Integration (Recommended)
+### Local Qwen-Omni with a remote Immich server
+
+The included [`docker-compose.yaml`](docker-compose.yaml) starts two local services:
+
+- **qwen-omni**: built from pinned vLLM-Omni 0.28.0 with the [Intel AutoRound 4-bit Qwen3-Omni checkpoint](https://huggingface.co/Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound).
+- **immich-analyze**: built from this checkout, with FFmpeg/ffprobe included, reading assets and updating descriptions through your remote Immich API.
+
+The local Qwen image includes a focused correction for an upstream INC parser-ownership bug that otherwise selects unquantized expert layers. Its build checks that expert weights remain 4-bit and router gates remain 16-bit. The fix changes metadata ownership only; it does not rewrite the checkpoint or disable audio understanding. See [`deploy/Dockerfile.qwen-omni`](deploy/Dockerfile.qwen-omni) and its checked patch script.
+
+No local Immich, PostgreSQL, Redis, external Docker network, or library mount is needed. Both image and video analysis use the same local model under the served name `qwen-omni`. The `llamacpp` interface setting selects the compatible OpenAI HTTP format; it does not start a separate llama.cpp server.
+
+**Prerequisites**
+
+- NVIDIA GPU access from Linux containers: Docker Desktop with WSL2/GPU support on Windows, or Docker Engine with NVIDIA Container Toolkit on Linux.
+- A single-GPU, 32 GB-class deployment target, enough Docker disk space for the image/model cache, and sufficient system memory. Close competing GPU workloads. The supplied configuration quantizes the thinker and omits speech-generation stages; actual capacity still depends on the checkpoint and input.
+- Outbound access to Hugging Face for the first model download and to your remote Immich origin. Use trusted HTTPS for Immich; TLS verification remains enabled.
+- An Immich API key with asset/search read, original-file download, and description-update permissions. Start with a restricted test user's library: batch/combined mode enumerates all assets visible to the supplied key.
+
+**Configure and start**
+
+Copy `.env.example` to `.env`:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+On Linux, use `cp .env.example .env`. Set `IMMICH_API_URL` to the remote origin, such as `https://photos.example.com` (do not append `/api`), and set `IMMICH_API_KEY`. Multiple user keys can be comma-separated. `.env` is excluded from Git and the Docker build context.
+
+```bash
+docker compose config --quiet
+docker pull vllm/vllm-omni:v0.28.0
+docker compose up -d --build --wait --wait-timeout 7200
+docker compose ps
+docker compose logs -f qwen-omni immich-analyze
+```
+
+The first startup downloads weights into the `qwen-omni-cache` volume and may take a while. The analyzer waits for model health; subsequent starts reuse the cache. Immich credentials are supplied only to the analyzer, and the optional `HF_TOKEN` only to the model service.
+
+The model API is bound to **127.0.0.1:8091** by default. It is unauthenticated and intended for this machine only; do not publish it on all network interfaces. `QWEN_OMNI_PORT` changes the host port. Containers use `http://qwen-omni:8091`, not localhost or your remote Immich hostname.
+
+Check the model list with `curl.exe http://127.0.0.1:8091/v1/models` on Windows, or `curl` on Linux. It should list `qwen-omni`. A direct PowerShell usage example:
+
+```powershell
+$body = @{
+    model = "qwen-omni"
+    modalities = @("text")
+    messages = @(@{ role = "user"; content = "What is 2 + 3? Answer with the number." })
+    max_tokens = 64
+    stream = $false
+} | ConvertTo-Json -Depth 6
+$response = Invoke-RestMethod -Uri http://127.0.0.1:8091/v1/chat/completions `
+    -Method Post -ContentType application/json -Body $body
+$response.choices[0].message.content
+```
+
+**Modes and description safety**
+
+The default `IMMICH_ANALYZE_MODE=combined` processes existing eligible assets, then continues detecting new assets concurrently. Set `monitor` to handle only assets added after initial synchronization. For a one-off batch, stop the long-running analyzer first:
+
+```bash
+docker compose stop immich-analyze
+docker compose run --rm -e IMMICH_ANALYZE_MODE=batch immich-analyze
+# Resume the mode configured in .env:
+docker compose up -d immich-analyze
+```
+
+Existing descriptions are skipped by default (`IMMICH_ANALYZE_OVERWRITE_POLICY=none`), including older poster-frame descriptions. `missing-ai` processes assets without an `[AI]` block; `all` permits replacing existing AI blocks. This Compose setup preserves human text outside those blocks. Do not run a second batch alongside the active analyzer.
+
+Videos are read from originals, not thumbnails, and processed sequentially in 30-second segments with up to 32 uniformly sampled source frames per segment. The first audio track is analyzed for speech and non-speech content; a missing audio track is valid. Descriptions contain video-relative timestamp ranges. A corrupt/oversized file, failed segment, or truncated model response leaves the existing description unchanged rather than storing a partial result or falling back to a poster frame.
+
+The default original-video limit is 2 GiB (`IMMICH_ANALYZE_VIDEO_MAX_BYTES`), with one active video per process. Temporary media is disk-backed and cleaned after processing. GPU placement/context settings are in [`deploy/qwen-omni.yaml`](deploy/qwen-omni.yaml); those values are literal YAML, not `.env` substitutions. `QWEN_OMNI_GPU_ID` selects the host GPU, which appears as GPU 0 inside the container. Override `QWEN_OMNI_MODEL` only with a compatible Qwen3-Omni checkpoint. Thinker-only deployment disables audio **generation**, not audio **understanding**.
+
+```bash
+docker compose down
+```
+
+Normal shutdown retains the model cache. Do not use `down -v` unless you intentionally want to remove the downloaded weights.
+
+### Existing Immich stack integration
 
 To integrate Immich Analyze directly into your Immich setup, add the following service to your `docker-compose.yaml` file:
 
@@ -191,6 +271,21 @@ IMMICH_API_URL=http://localhost:2283 IMMICH_API_KEY=your_key nix run github:tima
 | `IMMICH_ANALYZE_ENRICH_PROMPT` | Enable prompt enrichment with asset metadata (API mode only) | `false` |
 | `IMMICH_ANALYZE_API_POLL_INTERVAL` | Poll interval for API mode in seconds | `10` |
 
+#### Video Analysis Configuration
+
+These are general application defaults. The supplied Compose file enables video analysis and overrides both model names/hosts to the local `qwen-omni` service.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `IMMICH_ANALYZE_VIDEO_HOSTS` | Comma-separated OpenAI-compatible Omni server origins; nonempty enables original-video analysis. Do not append `/v1`. | *(disabled)* |
+| `IMMICH_ANALYZE_VIDEO_MODEL_NAME` | Model served by the video hosts | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
+| `IMMICH_ANALYZE_VIDEO_API_KEY` | Optional bearer key, read directly from the environment | *(none)* |
+| `IMMICH_ANALYZE_VIDEO_PROMPT` | Video description prompt covering visuals, speech, music, and environmental sounds | *Built-in audiovisual prompt* |
+| `IMMICH_ANALYZE_VIDEO_MAX_CONCURRENT` | Maximum active videos, shared by batch and monitoring | `1` |
+| `IMMICH_ANALYZE_VIDEO_MAX_BYTES` | Maximum original-video size; files are rejected, not truncated | `2147483648` |
+
+Without video hosts, existing preview-only behavior remains available. Standalone binaries need `ffmpeg` and `ffprobe` on PATH when video analysis is enabled; Docker and Nix packages include them. Missing original-download permission is an error, not a visual-only fallback.
+
 #### Application Settings
 
 | Variable | Description | Default |
@@ -251,6 +346,18 @@ Options:
           AI service interface type [default: ollama] [possible values: ollama, llamacpp]
       --hosts <HOSTS>
           Host URLs (Ollama or llama.cpp server) [default: http://localhost:11434]
+      --video-hosts <VIDEO_HOSTS>
+          Host URLs for video analysis (OpenAI-compatible server)
+      --video-model-name <VIDEO_MODEL_NAME>
+          Model name for video analysis [default: Qwen/Qwen3-Omni-30B-A3B-Instruct]
+      --video-api-key <VIDEO_API_KEY>
+          API key for video host authentication [env: IMMICH_ANALYZE_VIDEO_API_KEY]
+      --video-prompt <VIDEO_PROMPT>
+          Prompt for generating video description
+      --video-max-concurrent <VIDEO_MAX_CONCURRENT>
+          Maximum number of concurrent video requests [default: 1]
+      --video-max-bytes <VIDEO_MAX_BYTES>
+          Maximum original video size in bytes [default: 2147483648]
       --api-key <API_KEY>
           API key for authentication (llama.cpp server) [env: IMMICH_ANALYZE_API_KEY]
       --max-concurrent <MAX_CONCURRENT>
@@ -532,4 +639,4 @@ RUST_LOG=debug immich-analyze --combined ...
 - [x] Add support for multiple Immich API keys
 - [ ] Add JWT support
 - [ ] Add NixOS service module
-- [ ] Add video support
+- [x] Add video and audio analysis

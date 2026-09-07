@@ -28,7 +28,8 @@ RUN apk add --no-cache \
     ca-certificates \
     openssl \
     curl \
-    bash
+    bash \
+    ffmpeg
 
 RUN addgroup -S appuser && adduser -S appuser -G appuser
 

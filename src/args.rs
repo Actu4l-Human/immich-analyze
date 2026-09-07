@@ -78,6 +78,32 @@ pub struct Args {
     /// Host URLs (Ollama or llama.cpp server)
     #[arg(long, default_value = "http://localhost:11434", value_delimiter = ',')]
     pub hosts: Vec<String>,
+    /// Host URLs for video analysis (OpenAI-compatible server)
+    #[arg(long, value_delimiter = ',')]
+    pub video_hosts: Vec<String>,
+    /// Model name for video analysis
+    #[arg(long, default_value = "Qwen/Qwen3-Omni-30B-A3B-Instruct")]
+    pub video_model_name: String,
+    /// API key for video host authentication
+    #[arg(long, env = "IMMICH_ANALYZE_VIDEO_API_KEY", hide_env_values = true)]
+    pub video_api_key: Option<String>,
+    /// Prompt for generating video description
+    #[arg(
+        long,
+        default_value = concat!(
+            "Describe the visible events and audible content of this video segment for search. ",
+            "Include intelligible speech, music, and environmental sounds when present. ",
+            "Distinguish what is visible from what is heard, and do not invent uncertain details. ",
+            "Return only a concise description."
+        )
+    )]
+    pub video_prompt: String,
+    /// Maximum number of concurrent video requests
+    #[arg(long, default_value_t = 1)]
+    pub video_max_concurrent: usize,
+    /// Maximum original video size in bytes
+    #[arg(long, default_value_t = 2_147_483_648)]
+    pub video_max_bytes: u64,
     /// API key for authentication (llama.cpp server)
     #[arg(long, env = "IMMICH_ANALYZE_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,

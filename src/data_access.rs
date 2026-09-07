@@ -117,6 +117,88 @@ impl DataAccess {
         }
     }
 
+    fn resolve_original_path(
+        immich_root: &Path,
+        original_path: &Path,
+    ) -> Result<PathBuf, ImageAnalysisError> {
+        if original_path.is_absolute() {
+            return Ok(original_path.to_path_buf());
+        }
+
+        if original_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(ImageAnalysisError::InvalidImmichStructure {
+                error: format!(
+                    "Original path {} escapes the Immich root",
+                    original_path.display()
+                ),
+            });
+        }
+
+        Ok(immich_root.join(original_path))
+    }
+
+    pub async fn materialize_original(
+        &self,
+        asset_id: &Uuid,
+        destination: &Path,
+        max_bytes: u64,
+        timeout: std::time::Duration,
+    ) -> Result<PathBuf, ImageAnalysisError> {
+        match self {
+            Self::Database {
+                client,
+                immich_root,
+            } => {
+                let original_path = crate::database::get_original_path(client, *asset_id).await?;
+                let resolved = Self::resolve_original_path(immich_root, &original_path)?;
+                let metadata = tokio::fs::metadata(&resolved).await.map_err(|err| {
+                    ImageAnalysisError::IoError {
+                        path: resolved.display().to_string(),
+                        error: format_error_chain(&err),
+                    }
+                })?;
+                if !metadata.is_file() {
+                    return Err(ImageAnalysisError::InvalidImmichStructure {
+                        error: format!(
+                            "Original path {} is not a regular file",
+                            resolved.display()
+                        ),
+                    });
+                }
+                if metadata.len() == 0 {
+                    return Err(ImageAnalysisError::EmptyFile {
+                        filename: asset_id.to_string(),
+                    });
+                }
+                if metadata.len() > max_bytes {
+                    return Err(ImageAnalysisError::ProcessingError {
+                        filename: asset_id.to_string(),
+                        error: format!(
+                            "Original file exceeds the configured maximum of {max_bytes} bytes ({})",
+                            metadata.len()
+                        ),
+                    });
+                }
+                tokio::fs::File::open(&resolved).await.map_err(|err| {
+                    ImageAnalysisError::IoError {
+                        path: resolved.display().to_string(),
+                        error: format_error_chain(&err),
+                    }
+                })?;
+                Ok(resolved)
+            }
+            Self::ImmichApi { provider } => {
+                provider
+                    .download_original(asset_id, destination, max_bytes, timeout)
+                    .await?;
+                Ok(destination.to_path_buf())
+            }
+        }
+    }
+
     /// Helper: find preview file in thumbs directory tree for database mode.
     async fn find_preview_file_in_thumbs(
         immich_root: &Path,
@@ -301,5 +383,45 @@ impl DataAccess {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_original_path_keeps_absolute_paths() {
+        let root = tempdir().expect("tempdir");
+        let absolute = std::env::temp_dir().join("immich-originals/asset.mp4");
+
+        let resolved = DataAccess::resolve_original_path(root.path(), &absolute)
+            .expect("absolute path should pass through");
+
+        assert_eq!(resolved, absolute);
+    }
+
+    #[test]
+    fn resolve_original_path_joins_relative_paths_under_root() {
+        let root = tempdir().expect("tempdir");
+        let relative = PathBuf::from("library/originals/asset.mp4");
+
+        let resolved = DataAccess::resolve_original_path(root.path(), &relative)
+            .expect("relative path should resolve under root");
+
+        assert_eq!(resolved, root.path().join(&relative));
+    }
+
+    #[test]
+    fn resolve_original_path_rejects_parent_traversal() {
+        let root = tempdir().expect("tempdir");
+        let err = DataAccess::resolve_original_path(root.path(), Path::new("../outside/file.mp4"))
+            .expect_err("parent traversal should be rejected");
+
+        assert!(matches!(
+            err,
+            ImageAnalysisError::InvalidImmichStructure { .. }
+        ));
     }
 }
